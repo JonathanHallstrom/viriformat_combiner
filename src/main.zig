@@ -59,6 +59,9 @@ pub fn main() !u8 {
             }
             const start_current = i;
             i += MARLIN_BOARD_SIZE;
+            if (i >= file_size) {
+                break;
+            }
             const remaining_bytes = file_size - i;
             const u32_ptr: []const u32 = @ptrCast(@alignCast(mapped[i..]));
             const u32_slice = u32_ptr[0 .. remaining_bytes / 4];
