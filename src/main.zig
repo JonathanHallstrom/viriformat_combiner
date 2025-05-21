@@ -1,8 +1,13 @@
 const std = @import("std");
 
+const VALIDATE_MOVES = true;
 const MARLIN_BOARD_SIZE = 32;
 const MOVE_SCORE_PAIR_SIZE = 4;
 const NULL_TERMINATOR_ARRAY: [4]u8 = .{ 0, 0, 0, 0 };
+
+const PROMO_FLAG: u4 = 0b1100;
+const EP_FLAG: u4 = 0b0100;
+const CASTLE_FLAG: u4 = 0b1000;
 
 const ViriformatFileIterator = struct {
     file: std.fs.File,
@@ -16,15 +21,17 @@ const ViriformatFileIterator = struct {
 
         const stat = try std.posix.fstat(file.handle);
         const file_size: usize = @intCast(stat.size);
+        comptime std.debug.assert(MARLIN_BOARD_SIZE % MOVE_SCORE_PAIR_SIZE == 0);
+        const trimmed_size: usize = file_size - file_size % MOVE_SCORE_PAIR_SIZE;
 
-        const mapped = try std.posix.mmap(null, file_size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        const mapped = try std.posix.mmap(null, trimmed_size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
         errdefer std.posix.munmap(mapped);
 
         return .{
             .file = file,
             .mapped = mapped,
             .read_idx = 0,
-            .file_size = file_size,
+            .file_size = trimmed_size,
         };
     }
 
@@ -34,12 +41,16 @@ const ViriformatFileIterator = struct {
 
     // returns a full viriformat game or null if there are no valid ones left
     // returned slice does not include the null terminator
-    pub fn next(self: *ViriformatFileIterator) ?[]const u8 {
+    pub inline fn next(self: *ViriformatFileIterator) ?[]const u8 {
         if (self.bytesRemaining() == 0) {
             return null;
         }
 
         const game_start_idx = self.read_idx;
+        const initial_occupancy: u64 = std.mem.readInt(u64, self.mapped[game_start_idx..][0..8], .little);
+        if (@popCount(initial_occupancy) < 2) {
+            return null; // need to have at least two pieces to have two kings
+        }
         const move_start_idx = self.read_idx + MARLIN_BOARD_SIZE;
         if (move_start_idx >= self.file_size) {
             self.read_idx = self.file_size;
@@ -49,6 +60,43 @@ const ViriformatFileIterator = struct {
         const u32_slice = u32_ptr[0 .. (self.file_size - move_start_idx) / 4];
         const moves_in_game = std.mem.indexOfScalar(u32, u32_slice, 0) orelse return null;
         const move_end_idx = move_start_idx + MOVE_SCORE_PAIR_SIZE * moves_in_game;
+
+        if (VALIDATE_MOVES) {
+            var occ = initial_occupancy;
+            for (0..moves_in_game) |i| {
+                const move = std.mem.readInt(u16, self.mapped[move_start_idx..][i * MOVE_SCORE_PAIR_SIZE ..][0..2], .little);
+                const from = move & 0b111111;
+                const from_bb = @as(u64, 1) << @intCast(from);
+                const to = move >> 6 & 0b111111;
+                const to_bb = @as(u64, 1) << @intCast(to);
+                const flag = move >> 12;
+                const from_rank = from / 8;
+                // const to_rank = to / 8;
+                const to_file = to % 8;
+                if (occ & from_bb == 0) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
+                if (from == to) {
+                    @branchHint(.unlikely);
+                    return null;
+                }
+                if (flag == CASTLE_FLAG) {
+                    @branchHint(.unpredictable);
+                    const mask: u64 = if (from < to) 0b01100000 else 0b00001100;
+                    occ ^= from_bb ^ to_bb;
+                    occ |= mask << @intCast(from_rank * 8);
+                } else {
+                    occ ^= from_bb;
+                    occ |= to_bb;
+                }
+                if (flag == EP_FLAG) {
+                    @branchHint(.unlikely);
+                    occ ^= @as(u64, 1) << @intCast(8 * from_rank + to_file);
+                }
+            }
+        }
+
         self.read_idx += MARLIN_BOARD_SIZE + MOVE_SCORE_PAIR_SIZE * (moves_in_game + 1); // + 1 because we need to discard the null terminator
         return self.mapped[game_start_idx..move_end_idx];
     }
@@ -93,6 +141,7 @@ pub fn main() !u8 {
     var total_output_size: usize = 0;
     var total_count: usize = 0;
     var timer = try std.time.Timer.start();
+
     for (iterators.items) |*iter| {
         var count: usize = 0;
         var amount_written: usize = 0;
