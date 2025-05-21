@@ -42,6 +42,7 @@ const ViriformatFileIterator = struct {
         const game_start_idx = self.read_idx;
         const move_start_idx = self.read_idx + MARLIN_BOARD_SIZE;
         if (move_start_idx >= self.file_size) {
+            self.read_idx = self.file_size;
             return null;
         }
         const u32_ptr: []const u32 = @ptrCast(@alignCast(self.mapped[move_start_idx..]));
