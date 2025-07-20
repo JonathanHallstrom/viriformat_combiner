@@ -49,6 +49,7 @@ const ViriformatFileIterator = struct {
         const game_start_idx = self.read_idx;
         const initial_occupancy: u64 = std.mem.readInt(u64, self.mapped[game_start_idx..][0..8], .little);
         if (@popCount(initial_occupancy) < 2) {
+            self.read_idx = self.file_size;
             return null; // need to have at least two pieces to have two kings
         }
         const move_start_idx = self.read_idx + MARLIN_BOARD_SIZE;
@@ -75,10 +76,12 @@ const ViriformatFileIterator = struct {
                 const to_file = to % 8;
                 if (occ & from_bb == 0) {
                     @branchHint(.unlikely);
+                    self.read_idx = self.file_size;
                     return null;
                 }
                 if (from == to) {
                     @branchHint(.unlikely);
+                    self.read_idx = self.file_size;
                     return null;
                 }
                 if (flag == CASTLE_FLAG) {
@@ -107,6 +110,11 @@ const ViriformatFileIterator = struct {
     }
 };
 
+fn usage(err: anyerror) anyerror {
+    std.debug.print("Usage: viriformat_combiner [--no-shuffle] <output_file> <input_file>...\n\nCombines and shuffles games from multiple viriformat (.vf) files into a single new file.\n\nArguments:\n  --no-shuffle     Disables shuffling of games, combining them in the order they appear in input files.\n  <output_file>    The path to the new, combined file to be created.\n  <input_file>...  One or more paths to the input viriformat files.\n", .{});
+    return err;
+}
+
 pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -115,7 +123,20 @@ pub fn main() !u8 {
     defer args.deinit();
     _ = args.next(); // discard the name
 
-    const output_file_name = args.next() orelse return error.NoOutputFile;
+    var no_shuffle = false;
+
+    var seed: u64 = 0;
+    try std.posix.getrandom(std.mem.asBytes(&seed));
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+
+    // yeah this is ugly and hacky feel free to fix in a PR
+    var output_file_name = args.next() orelse return usage(error.NoOutputFile);
+    if (std.ascii.eqlIgnoreCase(output_file_name, "--no-shuffle")) {
+        no_shuffle = true;
+        output_file_name = args.next() orelse return usage(error.NoOutputFile);
+    }
+
     if (std.fs.cwd().statFile(output_file_name)) |_| {
         std.log.err("The specified output file ('{s}') already exists, exiting to avoid overwriting it", .{output_file_name});
         return error.OutputFileAlreadyExists;
@@ -129,8 +150,12 @@ pub fn main() !u8 {
 
     var iterators = std.ArrayList(ViriformatFileIterator).init(gpa.allocator());
     defer iterators.deinit();
+    var remaining_input_size: usize = 0;
     while (args.next()) |file_name| {
-        try iterators.append(try ViriformatFileIterator.init(file_name));
+        try iterators.append(ViriformatFileIterator.init(file_name) catch |e| return usage(e));
+    }
+    for (iterators.items) |iter| {
+        remaining_input_size += iter.bytesRemaining();
     }
     defer for (iterators.items) |iter| {
         iter.deinit();
@@ -142,19 +167,42 @@ pub fn main() !u8 {
     var total_count: usize = 0;
     var timer = try std.time.Timer.start();
 
-    for (iterators.items) |*iter| {
-        var count: usize = 0;
-        var amount_written: usize = 0;
-        while (iter.next()) |game| {
-            count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
-            amount_written += game.len;
-            try writer.writeAll(game);
-            try writer.writeAll(&NULL_TERMINATOR_ARRAY);
+    while (remaining_input_size > 0) {
+        const idx = random.uintLessThan(usize, remaining_input_size);
+        var accum_idx: usize = 0;
+        for (iterators.items) |*iter| {
+            const remaining = iter.bytesRemaining();
+            accum_idx += remaining;
+            if (accum_idx >= idx) {
+                const game = iter.next() orelse continue;
+                try writer.writeAll(game);
+                try writer.writeAll(&NULL_TERMINATOR_ARRAY);
+                total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
+                total_output_size += game.len;
+                remaining_input_size -= remaining - iter.bytesRemaining();
+                break;
+            }
         }
-
-        total_count += count;
-        total_output_size += amount_written;
+        remaining_input_size = 0;
+        for (iterators.items) |iter| {
+            remaining_input_size += iter.bytesRemaining();
+        }
     }
+
+    // for (iterators.items, 0..) |*iter, i| {
+    //     std.debug.print("processing file {}\n", .{i + 1});
+    //     var count: usize = 0;
+    //     var amount_written: usize = 0;
+    //     while (iter.next()) |game| {
+    //         count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
+    //         amount_written += game.len;
+    //         try writer.writeAll(game);
+    //         try writer.writeAll(&NULL_TERMINATOR_ARRAY);
+    //     }
+    //
+    //     total_count += count;
+    //     total_output_size += amount_written;
+    // }
     const elapsed = timer.read();
 
     std.debug.print("wrote a total of {} positions\n", .{total_count});
