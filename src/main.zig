@@ -90,7 +90,8 @@ const ViriformatFileIterator = struct {
                 if (flag == CASTLE_FLAG) {
                     @branchHint(.unpredictable);
                     const mask: u64 = if (from < to) 0b01100000 else 0b00001100;
-                    occ ^= from_bb ^ to_bb ^ mask << @intCast(from_rank * 8);
+                    occ &= ~(to_bb | from_bb);
+                    occ |= mask << @intCast(from_rank * 8);
                 } else {
                     occ ^= from_bb;
                     occ |= to_bb;
