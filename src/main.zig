@@ -190,14 +190,17 @@ pub fn main() !u8 {
 
     var timer = try std.time.Timer.start();
     var total_count: usize = 0;
+    var game_count: usize = 0;
 
     switch (mode) {
         .count => {
             for (iterators.items) |*iter| {
                 while (iter.next()) |game| {
                     total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
+                    game_count += 1;
                 }
             }
+            std.debug.print("{} games\n", .{game_count});
             std.debug.print("{} positions\n", .{total_count});
         },
         .concat, .shuffle => {
@@ -224,6 +227,7 @@ pub fn main() !u8 {
                         try writer.writeAll(&NULL_TERMINATOR_ARRAY);
                         total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
                         total_output_size += game.len + NULL_TERMINATOR_ARRAY.len;
+                        game_count += 1;
                     }
                 }
             } else {
@@ -253,6 +257,7 @@ pub fn main() !u8 {
                             try writer.writeAll(&NULL_TERMINATOR_ARRAY);
                             total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
                             total_output_size += game.len + NULL_TERMINATOR_ARRAY.len;
+                            game_count += 1;
 
                             const bytes_consumed = iter_bytes_before - iter.bytesRemaining();
                             remaining_input_size -= bytes_consumed;
@@ -274,6 +279,7 @@ pub fn main() !u8 {
 
             const elapsed = timer.read();
             std.debug.print("wrote a total of {} positions\n", .{total_count});
+            std.debug.print("wrote a total of {} games\n", .{game_count});
             std.debug.print("wrote {} at a speed of {d:.4}GB/s\n", .{
                 std.fmt.fmtIntSizeDec(total_output_size),
                 @as(f64, @floatFromInt(total_output_size)) * std.time.ns_per_s / 1e9 / @as(f64, @floatFromInt(elapsed)),
