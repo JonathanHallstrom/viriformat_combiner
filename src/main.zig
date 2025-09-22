@@ -114,14 +114,15 @@ const ViriformatFileIterator = struct {
 };
 
 fn usage(err: anyerror) anyerror {
-    std.debug.print("Usage: viriformat_combiner [--no-shuffle | --concat | --count] [<output_file>] <input_file>...\n\nCombines and shuffles games from multiple viriformat (.vf) files into a single new file.\n\nArguments:\n  --no-shuffle, --concat   Disables shuffling of games, combining them in the order they appear in input files.\n  --count                  Counts the number of positions in the input files and prints to stdout.\n  <output_file>            The path to the new, combined file to be created. Not used with --count.\n  <input_file>...          One or more paths to the input viriformat files.\n", .{});
+    std.debug.print("Usage: viriformat_combiner [--no-shuffle | --concat | --count | --take N] [<output_file>] <input_file>...\n\nCombines and shuffles games from multiple viriformat (.vf) files into a single new file.\n\nArguments:\n  --no-shuffle, --concat   Disables shuffling of games, combining them in the order they appear in input files.\n  --count                  Counts the number of positions in the input files and prints to stdout.\n  --take N                 Takes the first N games from the input files and writes them to the output file.\n  <output_file>            The path to the new, combined file to be created. Not used with --count.\n  <input_file>...          One or more paths to the input viriformat files.\n", .{});
     return err;
 }
 
-const Mode = enum {
+const Mode = union(enum) {
     concat,
     shuffle,
     count,
+    take: u64,
 };
 
 pub fn main() !u8 {
@@ -138,7 +139,7 @@ pub fn main() !u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
 
-    var input_file_names = std.ArrayList([]const u8).init(allocator);
+    var input_file_names = std.array_list.Managed([]const u8).init(allocator);
     defer input_file_names.deinit();
     var output_file_name: ?[]const u8 = null;
     var mode: Mode = .concat;
@@ -150,6 +151,13 @@ pub fn main() !u8 {
             mode = .concat;
         } else if (std.ascii.eqlIgnoreCase(argument, "--count")) {
             mode = .count;
+        } else if (std.ascii.eqlIgnoreCase(argument, "--take")) {
+            const count_str = args.next() orelse {
+                std.log.err("expected count after --take", .{});
+                return usage(error.MissingArgument);
+            };
+            const count = try std.fmt.parseInt(u64, count_str, 10);
+            mode = .{ .take = count };
         } else if (argument[0] == '-') {
             std.log.err("unknown flag: {s}", .{argument});
             return usage(error.UnknownFlag);
@@ -172,7 +180,7 @@ pub fn main() !u8 {
         return usage(error.NoOutputFile);
     }
 
-    var iterators = std.ArrayList(ViriformatFileIterator).init(allocator);
+    var iterators = std.array_list.Managed(ViriformatFileIterator).init(allocator);
     defer {
         for (iterators.items) |*iter| {
             iter.deinit();
@@ -214,17 +222,18 @@ pub fn main() !u8 {
             const output_file = try std.fs.cwd().createFile(out_filename, .{});
             defer output_file.close();
 
-            var bw = std.io.bufferedWriter(output_file.writer());
-            const writer = bw.writer();
-            defer bw.flush() catch |e| std.debug.panic("flushing outputfile failed with error: {}\n", .{e});
+            var output_buffer: [4096]u8 = undefined;
+
+            var writer = output_file.writer(&output_buffer);
+            defer writer.interface.flush() catch |e| std.debug.panic("flushing outputfile failed with error: {}\n", .{e});
 
             var total_output_size: usize = 0;
 
             if (mode == .concat) {
                 for (iterators.items) |*iter| {
                     while (iter.next()) |game| {
-                        try writer.writeAll(game);
-                        try writer.writeAll(&NULL_TERMINATOR_ARRAY);
+                        try writer.interface.writeAll(game);
+                        try writer.interface.writeAll(&NULL_TERMINATOR_ARRAY);
                         total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
                         total_output_size += game.len + NULL_TERMINATOR_ARRAY.len;
                         game_count += 1;
@@ -247,14 +256,13 @@ pub fn main() !u8 {
 
                         if (rand_val < bytes_seen + iter_bytes_before) {
                             const game = iter.next() orelse {
-                                // Invalid data at end of file.
                                 remaining_input_size -= iter_bytes_before;
                                 processed_in_iteration = true;
                                 break;
                             };
 
-                            try writer.writeAll(game);
-                            try writer.writeAll(&NULL_TERMINATOR_ARRAY);
+                            try writer.interface.writeAll(game);
+                            try writer.interface.writeAll(&NULL_TERMINATOR_ARRAY);
                             total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
                             total_output_size += game.len + NULL_TERMINATOR_ARRAY.len;
                             game_count += 1;
@@ -262,13 +270,11 @@ pub fn main() !u8 {
                             const bytes_consumed = iter_bytes_before - iter.bytesRemaining();
                             remaining_input_size -= bytes_consumed;
                             processed_in_iteration = true;
-                            break; // Exit inner for loop, continue with while
+                            break;
                         }
                         bytes_seen += iter_bytes_before;
                     }
                     if (!processed_in_iteration) {
-                        // This can happen if all remaining data is invalid.
-                        // Recalculate to be safe and exit if needed.
                         remaining_input_size = 0;
                         for (iterators.items) |*iter| {
                             remaining_input_size += iter.bytesRemaining();
@@ -280,8 +286,52 @@ pub fn main() !u8 {
             const elapsed = timer.read();
             std.debug.print("wrote a total of {} positions\n", .{total_count});
             std.debug.print("wrote a total of {} games\n", .{game_count});
-            std.debug.print("wrote {} at a speed of {d:.4}GB/s\n", .{
-                std.fmt.fmtIntSizeDec(total_output_size),
+            std.debug.print("wrote {B} at a speed of {d:.4}GB/s\n", .{
+                total_output_size,
+                @as(f64, @floatFromInt(total_output_size)) * std.time.ns_per_s / 1e9 / @as(f64, @floatFromInt(elapsed)),
+            });
+        },
+        .take => |n| {
+            const out_filename = output_file_name orelse unreachable;
+
+            if (std.fs.cwd().statFile(out_filename)) |_| {
+                std.log.err("the specified output file ('{s}') already exists, exiting to avoid overwriting it", .{out_filename});
+                return error.OutputFileAlreadyExists;
+            } else |_| {}
+
+            const output_file = try std.fs.cwd().createFile(out_filename, .{});
+            defer output_file.close();
+
+            var output_buffer: [4096]u8 = undefined;
+
+            var writer = output_file.writer(&output_buffer);
+            defer writer.interface.flush() catch |e| std.debug.panic("flushing outputfile failed with error: {}\n", .{e});
+
+            var total_output_size: usize = 0;
+            var games_written: u64 = 0;
+
+            for (iterators.items) |*iter| {
+                if (games_written >= n) {
+                    break;
+                }
+                while (iter.next()) |game| {
+                    if (games_written >= n) {
+                        break;
+                    }
+                    try writer.interface.writeAll(game);
+                    try writer.interface.writeAll(&NULL_TERMINATOR_ARRAY);
+                    total_count += (game.len - MARLIN_BOARD_SIZE) / MOVE_SCORE_PAIR_SIZE;
+                    total_output_size += game.len + NULL_TERMINATOR_ARRAY.len;
+                    game_count += 1;
+                    games_written += 1;
+                }
+            }
+
+            const elapsed = timer.read();
+            std.debug.print("wrote a total of {} positions\n", .{total_count});
+            std.debug.print("wrote a total of {} games\n", .{game_count});
+            std.debug.print("wrote {B} at a speed of {d:.4}GB/s\n", .{
+                total_output_size,
                 @as(f64, @floatFromInt(total_output_size)) * std.time.ns_per_s / 1e9 / @as(f64, @floatFromInt(elapsed)),
             });
         },
